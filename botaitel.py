@@ -125,7 +125,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # بررسی عضویت در چنل
     if not await check_channel_membership(update, context):
-        keyboard = [[InlineKeyboardButton("🔗 عضویت در چنل", url=f"https://t.me/{CHANNEL_ID[1:]}")]]
+        keyboard = [[InlineKeyboardButton(f"🔗 عضویت در {channel_id[1:]}", url=f"https://t.me/{channel_id[1:]}")] for channel_id in CHANNEL_ID]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
             f"سلام {first_name}! 👋\n\n"
