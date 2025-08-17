@@ -11,10 +11,12 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.error import TelegramError, Forbidden, BadRequest, NetworkError, TimedOut
 import threading
 from contextlib import asynccontextmanager
+import aiohttp
+import base64
 
 # 🔧 تنظیمات
 BOT_TOKEN = "7871342383:AAEnHXtvc6txRoyGegRL_IeErLISmS4j_DQ"  # توکن ربات تلگرام
-CHANNEL_IDS = ["@infinityIeveI", "@sharabyi"]  # آیدی چنل‌های مورد نظر
+CHANNEL_IDS = ["infinityIeveI", "golden_market7"]  # آیدی چنل‌های مورد نظر
 ADMIN_IDS = [2065070882, 6508600903]  # آیدی عددی ادمین‌ها
 
 # 🤖 کلاینت AI - استفاده از g4f
@@ -38,6 +40,7 @@ USER_DATA_FILE = "user_data.json"
 user_messages: Dict[int, List[float]] = {}
 user_chat_history: Dict[int, List[Dict[str, str]]] = {}
 user_channel_status: Dict[int, bool] = {}  # کش برای وضعیت عضویت
+user_mode: Dict[int, str] = {}  # حالت کاربر: home, text_ai, image_gen
 data_lock = threading.Lock()
 
 # 📝 تنظیمات لاگ
@@ -67,7 +70,7 @@ def safe_file_operation(operation_func, *args, **kwargs):
 
 def load_user_data():
     """بارگذاری امن داده‌های کاربران از فایل"""
-    global user_messages, user_chat_history, user_channel_status
+    global user_messages, user_chat_history, user_channel_status, user_mode
     
     def _load():
         if os.path.exists(USER_DATA_FILE):
@@ -82,6 +85,7 @@ def load_user_data():
                 user_messages = {int(k): v for k, v in data.get('messages', {}).items() if isinstance(v, list)}
                 user_chat_history = {int(k): v for k, v in data.get('history', {}).items() if isinstance(v, list)}
                 user_channel_status = {int(k): v for k, v in data.get('channel_status', {}).items() if isinstance(v, bool)}
+                user_mode = {int(k): v for k, v in data.get('user_mode', {}).items() if isinstance(v, str)}
                 
                 logger.info(f"داده‌های {len(user_messages)} کاربر بارگذاری شد")
                 
@@ -96,10 +100,12 @@ def load_user_data():
                 user_messages = {}
                 user_chat_history = {}
                 user_channel_status = {}
+                user_mode = {}
         else:
             user_messages = {}
             user_chat_history = {}
             user_channel_status = {}
+            user_mode = {}
     
     safe_file_operation(_load)
 
@@ -110,7 +116,8 @@ def save_user_data():
             data = {
                 'messages': {str(k): v for k, v in user_messages.items()},
                 'history': {str(k): v for k, v in user_chat_history.items()},
-                'channel_status': {str(k): v for k, v in user_channel_status.items()}
+                'channel_status': {str(k): v for k, v in user_channel_status.items()},
+                'user_mode': {str(k): v for k, v in user_mode.items()}
             }
             
             # ذخیره در فایل موقت ابتدا
@@ -248,6 +255,10 @@ def modify_ai_response(response: str) -> str:
 async def check_single_channel_membership(context: ContextTypes.DEFAULT_TYPE, user_id: int, channel_id: str) -> bool:
     """بررسی عضویت در یک چنل"""
     try:
+        # اضافه کردن @ اگر وجود نداشته باشد
+        if not channel_id.startswith('@'):
+            channel_id = f"@{channel_id}"
+        
         member = await context.bot.get_chat_member(channel_id, user_id)
         return member.status in ['member', 'administrator', 'creator']
     except Forbidden:
@@ -255,13 +266,17 @@ async def check_single_channel_membership(context: ContextTypes.DEFAULT_TYPE, us
         return False
     except BadRequest as e:
         if "user not found" in str(e).lower():
-            logger.warning(f"کاربر {user_id} در چنل {channel_id} یافت نشد")
+            logger.warning(f"کاربر {user_id} در چنل {channel_id} یافت نشد - احتمالاً عضو نیست")
+            return False
+        elif "chat not found" in str(e).lower():
+            logger.error(f"چنل {channel_id} یافت نشد - آیدی چنل اشتباه است")
             return False
         logger.error(f"خطا در بررسی عضویت {user_id} در {channel_id}: {e}")
         return False
     except (NetworkError, TimedOut) as e:
         logger.warning(f"مشکل شبکه در بررسی عضویت {user_id} در {channel_id}: {e}")
-        return False
+        # در صورت مشکل شبکه، اجازه دسترسی بده تا کاربر مشکل نداشته باشد
+        return True
     except Exception as e:
         logger.error(f"خطای غیرمنتظره در بررسی عضویت {user_id} در {channel_id}: {e}")
         return False
@@ -321,6 +336,94 @@ def create_channel_keyboard() -> InlineKeyboardMarkup:
     keyboard.append([InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_membership")])
     return InlineKeyboardMarkup(keyboard)
 
+def create_main_menu_keyboard() -> InlineKeyboardMarkup:
+    """ایجاد کیبورد منوی اصلی"""
+    keyboard = [
+        [InlineKeyboardButton("💬 هوش مصنوعی متنی", callback_data="text_ai")],
+        [InlineKeyboardButton("🎨 هوش مصنوعی تولید عکس", callback_data="image_gen")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def create_back_keyboard() -> InlineKeyboardMarkup:
+    """ایجاد کیبورد بازگشت"""
+    keyboard = [
+        [InlineKeyboardButton("🏠 بازگشت به خانه", callback_data="back_home")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# 🖼️ تولید عکس
+async def generate_image(prompt: str) -> Optional[str]:
+    """تولید عکس با g4f"""
+    if not AI_AVAILABLE or not ai_client:
+        return None
+    
+    try:
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: ai_client.images.generate(
+                model="flux",
+                prompt=prompt,
+                response_format="url"
+            )
+        )
+        
+        if response and response.data and len(response.data) > 0:
+            return response.data[0].url
+        return None
+        
+    except Exception as e:
+        logger.error(f"خطا در تولید عکس: {e}")
+        return None
+
+async def download_image(url: str) -> Optional[bytes]:
+    """دانلود عکس از URL"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    return await response.read()
+        return None
+    except Exception as e:
+        logger.error(f"خطا در دانلود عکس: {e}")
+        return None
+
+# 👁️ پردازش تصویر
+async def process_image_with_ai(image_data: bytes, user_message: str) -> str:
+    """پردازش تصویر با AI"""
+    if not AI_AVAILABLE or not ai_client:
+        return "❌ سیستم پردازش تصویر در دسترس نیست."
+    
+    try:
+        # تبدیل تصویر به base64
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+        
+        # ساخت پیام برای AI
+        messages = [
+            {
+                "role": "user",
+                "content": f"تصویر: data:image/jpeg;base64,{image_base64}\n\nپیام: {user_message}"
+            }
+        ]
+        
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: ai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                stream=False
+            )
+        )
+        
+        if response and response.choices:
+            bot_reply = response.choices[0].message.content.strip()
+            return modify_ai_response(bot_reply)
+        else:
+            return "متاسفانه نمی‌توانم تصویر را تحلیل کنم."
+            
+    except Exception as e:
+        logger.error(f"خطا در پردازش تصویر: {e}")
+        return "متاسفانه در حال حاضر امکان تحلیل تصویر وجود ندارد."
+
 # 🎯 دستورات ربات
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """دستور شروع"""
@@ -344,6 +447,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
+        # تنظیم حالت کاربر به خانه
+        user_mode[user_id] = "home"
+        await async_save_data()
+        
         welcome_text = f"""
 🤖 سلام {first_name}، به ربات هوش مصنوعی خوش آمدید!
 
@@ -352,21 +459,55 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • ادمین‌ها: نامحدود
 • عضویت در چنل‌ها الزامی است
 
-💡 فقط سوال خود را بفرستید و پاسخ دریافت کنید!
+🔧 دستورات مفید:
+• /resetchat - ریست کردن مکالمه
 
 🆔 آیدی شما: {user_id}
+
+لطفاً یکی از گزینه‌های زیر را انتخاب کنید:
 
 @AnishtaYiN 
 🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن
 """
         
-        await update.message.reply_text(welcome_text)
+        keyboard = create_main_menu_keyboard()
+        await update.message.reply_text(welcome_text, reply_markup=keyboard)
         
     except Exception as e:
         logger.error(f"خطا در دستور start برای کاربر {user_id}: {e}")
         await update.message.reply_text(
             "❌ خطا در راه‌اندازی ربات. لطفاً دوباره تلاش کنید."
         )
+
+async def resetchat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ریست کردن مکالمه کاربر"""
+    if not update.effective_user:
+        return
+    
+    user_id = update.effective_user.id
+    first_name = update.effective_user.first_name or "کاربر"
+    
+    try:
+        # پاک کردن تاریخچه مکالمه
+        if user_id in user_chat_history:
+            user_chat_history[user_id] = []
+        
+        # تنظیم حالت کاربر به خانه
+        user_mode[user_id] = "home"
+        await async_save_data()
+        
+        keyboard = create_main_menu_keyboard()
+        await update.message.reply_text(
+            f"✅ {first_name}، مکالمه شما ریست شد!\n\n"
+            "لطفاً یکی از گزینه‌های زیر را انتخاب کنید:\n\n"
+            "@AnishtaYiN \n"
+            "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن",
+            reply_markup=keyboard
+        )
+        
+    except Exception as e:
+        logger.error(f"خطا در ریست چت کاربر {user_id}: {e}")
+        await update.message.reply_text("❌ خطا در ریست کردن مکالمه!")
 
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """پردازش callback queryها"""
@@ -376,20 +517,24 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     try:
         await query.answer()
+        user_id = update.effective_user.id
+        first_name = update.effective_user.first_name or "کاربر"
         
         if query.data == "check_membership":
-            user_id = update.effective_user.id
-            first_name = update.effective_user.first_name or "کاربر"
-            
             # بررسی مجدد عضویت
             if await check_channel_membership(update, context, force_refresh=True):
+                user_mode[user_id] = "home"
+                await async_save_data()
+                
+                keyboard = create_main_menu_keyboard()
                 await query.edit_message_text(
                     f"✅ تبریک {first_name}!\n\n"
                     "شما با موفقیت در تمام چنل‌ها عضو شدید.\n"
                     "حالا می‌توانید از ربات استفاده کنید.\n\n"
-                    "💡 فقط سوال خود را بفرستید!\n\n"
+                    "لطفاً یکی از گزینه‌های زیر را انتخاب کنید:\n\n"
                     "@AnishtaYiN \n"
-                    "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن"
+                    "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن",
+                    reply_markup=keyboard
                 )
             else:
                 keyboard = create_channel_keyboard()
@@ -398,6 +543,49 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                     "لطفاً ابتدا در تمام چنل‌ها عضو شوید، سپس دوباره بررسی کنید.",
                     reply_markup=keyboard
                 )
+        
+        elif query.data == "text_ai":
+            user_mode[user_id] = "text_ai"
+            await async_save_data()
+            
+            keyboard = create_back_keyboard()
+            await query.edit_message_text(
+                f"💬 {first_name}، شما در حالت هوش مصنوعی متنی هستید.\n\n"
+                "🔸 متن یا سوال خود را بفرستید\n"
+                "🔸 می‌توانید تصویر همراه با متن بفرستید\n"
+                "🔸 برای ریست کردن مکالمه: /resetchat\n\n"
+                "@AnishtaYiN \n"
+                "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن",
+                reply_markup=keyboard
+            )
+        
+        elif query.data == "image_gen":
+            user_mode[user_id] = "image_gen"
+            await async_save_data()
+            
+            keyboard = create_back_keyboard()
+            await query.edit_message_text(
+                f"🎨 {first_name}، شما در حالت تولید عکس هستید.\n\n"
+                "🔸 توضیحات عکسی که می‌خواهید را بفرستید\n"
+                "🔸 مثال: \"یک گربه سفید در باغ\"\n"
+                "🔸 بهتر است توضیحات را به انگلیسی بفرستید\n\n"
+                "@AnishtaYiN \n"
+                "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن",
+                reply_markup=keyboard
+            )
+        
+        elif query.data == "back_home":
+            user_mode[user_id] = "home"
+            await async_save_data()
+            
+            keyboard = create_main_menu_keyboard()
+            await query.edit_message_text(
+                f"🏠 {first_name}، به خانه برگشتید.\n\n"
+                "لطفاً یکی از گزینه‌های زیر را انتخاب کنید:\n\n"
+                "@AnishtaYiN \n"
+                "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن",
+                reply_markup=keyboard
+            )
                 
     except Exception as e:
         logger.error(f"خطا در callback query handler: {e}")
@@ -440,21 +628,26 @@ async def get_ai_response(user_history: List[Dict[str, str]], user_message: str)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """پردازش پیام‌های کاربران"""
-    if not update.effective_user or not update.message or not update.message.text:
+    if not update.effective_user or not update.message:
         return
     
     user_id = update.effective_user.id
-    user_message = update.message.text.strip()
     first_name = update.effective_user.first_name or "کاربر"
     
-    # بررسی طول پیام
-    if len(user_message) > 1000:
+    # بررسی حالت کاربر
+    current_mode = user_mode.get(user_id, "home")
+    
+    if current_mode == "home":
+        keyboard = create_main_menu_keyboard()
         await update.message.reply_text(
-            "❌ پیام شما بیش از حد طولانی است. لطفاً پیام کوتاه‌تری ارسال کنید."
+            f"🏠 {first_name}، لطفاً ابتدا یکی از گزینه‌ها را انتخاب کنید:\n\n"
+            "@AnishtaYiN \n"
+            "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن",
+            reply_markup=keyboard
         )
         return
     
-    logger.info(f"پیام از کاربر {user_id} ({first_name}): {user_message[:50]}...")
+    logger.info(f"پیام از کاربر {user_id} ({first_name}) در حالت {current_mode}")
     
     try:
         # بررسی دسترسی AI
@@ -489,6 +682,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ارسال پیام "در حال تایپ..."
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
         
+        if current_mode == "text_ai":
+            await handle_text_ai_message(update, context, user_id, first_name)
+        elif current_mode == "image_gen":
+            await handle_image_gen_message(update, context, user_id, first_name)
+        
+    except Exception as e:
+        logger.error(f"خطا در پردازش پیام کاربر {user_id}: {str(e)}")
+        await update.message.reply_text(
+            f"❌ خطا در پردازش پیام: {str(e)}\n\n"
+            "لطفاً دوباره تلاش کنید.\n\n"
+            f"🆔 آیدی شما: {user_id}\n\n"
+            "@AnishtaYiN \n"
+            "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن"
+        )
+
+async def handle_text_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, first_name: str):
+    """پردازش پیام در حالت هوش مصنوعی متنی"""
+    try:
         # آماده‌سازی تاریخچه گفتگو
         if user_id not in user_chat_history:
             user_chat_history[user_id] = []
@@ -508,12 +719,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # حفظ system message و ۲۰ پیام آخر
             user_chat_history[user_id] = [user_chat_history[user_id][0]] + user_chat_history[user_id][-20:]
         
-        # دریافت پاسخ AI
-        bot_reply = await get_ai_response(user_chat_history[user_id], user_message)
-        
-        # اضافه کردن پیام‌ها به تاریخچه
-        user_chat_history[user_id].append({"role": "user", "content": user_message})
-        user_chat_history[user_id].append({"role": "assistant", "content": bot_reply})
+        # بررسی وجود تصویر
+        if update.message.photo:
+            # دانلود تصویر
+            photo = update.message.photo[-1]  # بزرگترین سایز
+            file = await context.bot.get_file(photo.file_id)
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(file.file_path) as response:
+                    image_data = await response.read()
+            
+            # متن همراه تصویر
+            user_message = update.message.caption or "این تصویر را تحلیل کن"
+            
+            # پردازش تصویر با AI
+            bot_reply = await process_image_with_ai(image_data, user_message)
+        else:
+            # پردازش پیام متنی
+            user_message = update.message.text.strip()
+            
+            # بررسی طول پیام
+            if len(user_message) > 1000:
+                await update.message.reply_text(
+                    "❌ پیام شما بیش از حد طولانی است. لطفاً پیام کوتاه‌تری ارسال کنید."
+                )
+                return
+            
+            # دریافت پاسخ AI
+            bot_reply = await get_ai_response(user_chat_history[user_id], user_message)
+            
+            # اضافه کردن پیام‌ها به تاریخچه
+            user_chat_history[user_id].append({"role": "user", "content": user_message})
+            user_chat_history[user_id].append({"role": "assistant", "content": bot_reply})
         
         # محدود کردن طول پاسخ
         if len(bot_reply) > 4000:
@@ -550,17 +787,102 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن"
                 )
         
-        logger.info(f"پاسخ ارسال شد برای کاربر {user_id}")
+        logger.info(f"پاسخ متنی ارسال شد برای کاربر {user_id}")
         
     except Exception as e:
-        logger.error(f"خطا در پردازش پیام کاربر {user_id}: {str(e)}")
-        await update.message.reply_text(
-            f"❌ خطا در پردازش پیام: {str(e)}\n\n"
-            "لطفاً دوباره تلاش کنید.\n\n"
-            f"🆔 آیدی شما: {user_id}\n\n"
-            "@AnishtaYiN \n"
-            "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن"
+        logger.error(f"خطا در پردازش پیام متنی: {e}")
+        raise
+
+async def handle_image_gen_message(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, first_name: str):
+    """پردازش پیام در حالت تولید عکس"""
+    try:
+        if not update.message.text:
+            await update.message.reply_text(
+                "❌ لطفاً توضیحات عکسی که می‌خواهید را بفرستید.\n\n"
+                "@AnishtaYiN \n"
+                "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن"
+            )
+            return
+        
+        user_prompt = update.message.text.strip()
+        
+        # بررسی طول پرامپت
+        if len(user_prompt) > 500:
+            await update.message.reply_text(
+                "❌ توضیحات شما بیش از حد طولانی است. لطفاً توضیحات کوتاه‌تری ارسال کنید."
+            )
+            return
+        
+        # ارسال پیام انتظار
+        wait_message = await update.message.reply_text(
+            "🎨 در حال تولید عکس...\nلطفاً صبر کنید، این ممکن است چند لحظه طول بکشد."
         )
+        
+        # تولید عکس
+        image_url = await generate_image(user_prompt)
+        
+        if not image_url:
+            await wait_message.edit_text(
+                "❌ متاسفانه نتوانستم عکس را تولید کنم. لطفاً دوباره تلاش کنید.\n\n"
+                "@AnishtaYiN \n"
+                "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن"
+            )
+            return
+        
+        # دانلود عکس
+        image_data = await download_image(image_url)
+        
+        if not image_data:
+            await wait_message.edit_text(
+                "❌ متاسفانه نتوانستم عکس را دانلود کنم. لطفاً دوباره تلاش کنید.\n\n"
+                "@AnishtaYiN \n"
+                "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن"
+            )
+            return
+        
+        # ارسال عکس
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=image_data,
+            caption=f"🎨 عکس تولید شده برای: {user_prompt}\n\n@AnishtaYiN \n🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن"
+        )
+        
+        # حذف پیام انتظار
+        try:
+            await wait_message.delete()
+        except:
+            pass
+        
+        # اضافه کردن پیام به شمارنده
+        add_message(user_id)
+        
+        # بررسی رسیدن به حد مجاز
+        clean_old_messages(user_id)
+        remaining_messages = 5 - len(user_messages[user_id])
+        
+        if remaining_messages <= 1 and not is_admin(user_id):
+            if remaining_messages == 0:
+                remaining_time = get_remaining_time(user_id)
+                await update.message.reply_text(
+                    f"⚠️ {first_name}، شما ۵ پیام خود را استفاده کردید.\n\n"
+                    f"⏳ زمان باقی‌مانده: {format_time(remaining_time)}\n\n"
+                    f"🆔 آیدی شما: {user_id}\n\n"
+                    "@AnishtaYiN \n"
+                    "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن"
+                )
+            else:
+                await update.message.reply_text(
+                    f"📊 آخرین پیام شما! پیام‌های باقی‌مانده: {remaining_messages}/5\n\n"
+                    f"🆔 آیدی شما: {user_id}\n\n"
+                    "@AnishtaYiN \n"
+                    "🧠 هوش مصنوعی ساخته شده توسط پارسا انیشتن"
+                )
+        
+        logger.info(f"عکس تولید و ارسال شد برای کاربر {user_id}")
+        
+    except Exception as e:
+        logger.error(f"خطا در تولید عکس: {e}")
+        raise
 
 # 👨‍💼 دستورات ادمین
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -579,6 +901,13 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_users = sum(1 for msgs in user_messages.values() if msgs)
         total_messages = sum(len(msgs) for msgs in user_messages.values())
         
+        # آمار حالت‌ها
+        mode_stats = {}
+        for mode in user_mode.values():
+            mode_stats[mode] = mode_stats.get(mode, 0) + 1
+        
+        mode_text = "\n".join([f"  {mode}: {count}" for mode, count in mode_stats.items()])
+        
         stats_text = f"""
 📊 آمار ربات:
 
@@ -587,6 +916,9 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💬 کل پیام‌ها: {total_messages}
 ⚡ ادمین‌ها: {len(ADMIN_IDS)}
 🔗 چنل‌ها: {len(CHANNEL_IDS)}
+
+📱 حالت‌های کاربران:
+{mode_text}
 
 🤖 وضعیت AI: {'✅ فعال' if AI_AVAILABLE else '❌ غیرفعال'}
 
@@ -622,8 +954,13 @@ async def reset_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             # پاک کردن کش عضویت چنل
             if target_user_id in user_channel_status:
                 del user_channel_status[target_user_id]
+            # پاک کردن تاریخچه مکالمه
+            if target_user_id in user_chat_history:
+                user_chat_history[target_user_id] = []
+            # ریست حالت کاربر
+            user_mode[target_user_id] = "home"
             await async_save_data()
-            await update.message.reply_text(f"✅ محدودیت کاربر {target_user_id} ریست شد!")
+            await update.message.reply_text(f"✅ محدودیت و داده‌های کاربر {target_user_id} ریست شد!")
         else:
             await update.message.reply_text("❌ کاربر یافت نشد!")
     except ValueError:
@@ -707,11 +1044,12 @@ def main():
         
         # اضافه کردن هندلرها
         application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("resetchat", resetchat_command))
         application.add_handler(CommandHandler("stats", admin_stats))
         application.add_handler(CommandHandler("reset", reset_user_command))
         application.add_handler(CommandHandler("broadcast", broadcast_command))
         application.add_handler(CallbackQueryHandler(callback_query_handler))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, handle_message))
         
         # اضافه کردن error handler
         application.add_error_handler(error_handler)
